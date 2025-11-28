@@ -1,4 +1,4 @@
+python-telegram-bot==20.3
 selenium
 webdriver-manager
-python-telegram-bot==20.7
 requests
