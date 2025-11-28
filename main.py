@@ -29,8 +29,8 @@ from telegram.ext import (
 # ============================================================
 # 🔐 قراءة المفاتيح من Environment
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+BOT_TOKEN = os.getenv("8590131508:AAEQHi77AEzlaoRpN5LYixPrc7_aOUP5osY")
+DEEPSEEK_API_KEY = os.getenv("sk-8215110c094649bfbbe3aaae2842bf65")
 
 # ============================================================
 # إعداد Chrome لمسار Render
