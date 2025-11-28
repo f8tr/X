@@ -3,7 +3,6 @@ import re
 import html
 import json
 import asyncio
-import subprocess
 from collections import Counter
 from datetime import datetime
 
@@ -19,104 +18,193 @@ from telegram.ext import (
 )
 
 # =========================================
-# 🔐 قرائة المتغيرات من Environment
+# 🔐 قراءة المفاتيح من Environment
 # =========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
+# لو واحد منهم ناقص خلي البرنامج يطيح بدري
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN مهو موجود في Environment")
+if not DEEPSEEK_API_KEY:
+    raise RuntimeError("DEEPSEEK_API_KEY مهو موجود في Environment")
+
+# طابور الطلبات
 request_queue = asyncio.Queue()
 
+# =========================================
+# 🌐 Nitter Instances (بدائل تويتر بدون لوجن)
+# =========================================
+NITTER_INSTANCES = [
+    "https://nitter.poast.org",
+    "https://nitter.fdn.fr",
+    "https://nitter.lacontrevoie.fr",
+    "https://nitter.cz",
+    "https://n.opnxng.com",
+    "https://nitter.esmailelbob.xyz",
+]
 
-# =========================================
-# 🔧 دوال مساعدة بسيطة
-# =========================================
-def clean_text(text):
+
+def clean_text(text: str) -> str:
     if not text:
         return "غير معروف"
     return html.escape(str(text))
 
 
-def run_snscrape(args):
-    """
-    تشغيل snscrape عن طريق subprocess
-    """
-    try:
-        result = subprocess.run(
-            ["snscrape", "--jsonl"] + args,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        return result.stdout.splitlines()
-    except Exception:
-        return []
+def strip_tags(s: str) -> str:
+    return re.sub(r"<.*?>", "", s or "")
 
 
-# =========================================
-# 🐦 سحب بيانات حساب تويتر بدون تسجيل دخول
-# =========================================
-def get_user_profile(username):
+def fetch_from_nitter(path: str):
     """
-    يرجع معلومات اساسية عن المستخدم باستخدام snscrape twitter-user
+    يلف على اكثر من سيرفر Nitter لين يلقى واحد يرد
+    يرجع (النص, الدومين) او (None, None)
     """
-    lines = run_snscrape([f"twitter-user {username}"])
-    if not lines:
-        return None, []
-
-    # اول سطر فيه تغريدة + بيانات يوزر
-    first = json.loads(lines[0])
-    user = first.get("user", first)
-
-    bio = user.get("description") or "لا يوجد"
-    loc = user.get("location") or "غير معروف"
-    created = user.get("created") or user.get("created_at")
-    if created:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"
+    }
+    for base in NITTER_INSTANCES:
+        url = base.rstrip("/") + path
         try:
-            # snscrape يرجع ISO datetime
-            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            joined = dt.strftime("%B %Y")
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 200 and r.text.strip():
+                return r.text, base
         except Exception:
-            joined = str(created)
-    else:
-        joined = "غير معروف"
+            continue
+    return None, None
+
+
+# =========================================
+# 🐦 سحب بيانات الحساب + التغريدات من Nitter
+# =========================================
+def get_profile_and_tweets(username: str):
+    """
+    يرجع:
+      profile: dict فيه (name, username, bio, loc, joined)
+      tweets: list فيه عناصر {text, date}
+      sources_counter: Counter لمصادر التغريدات (iPhone, Web...)
+    """
+
+    # 1) صفحة البروفايل HTML
+    html_page, used_base = fetch_from_nitter(f"/{username}")
+    if not html_page:
+        return None, [], Counter()
+
+    # الاسم الظاهر
+    name = username
+    m_name = re.search(
+        r'class="profile-card-fullname"[^>]*>(.*?)</', html_page, re.S
+    )
+    if m_name:
+        name = strip_tags(m_name.group(1)).strip()
+
+    # البايو
+    bio = "لا يوجد"
+    m_bio = re.search(
+        r'class="profile-bio"[^>]*>(.*?)</(div|p)>', html_page, re.S
+    )
+    if m_bio:
+        bio = strip_tags(m_bio.group(1)).strip()
+        if not bio:
+            bio = "لا يوجد"
+
+    # الموقع / الدولة من خانة اللوكيشن
+    loc = "غير معروف"
+    m_loc = re.search(
+        r'class="profile-location"[^>]*>.*?<span[^>]*>(.*?)</span>',
+        html_page,
+        re.S,
+    )
+    if m_loc:
+        loc = strip_tags(m_loc.group(1)).strip() or "غير معروف"
+
+    # تاريخ الانضمام
+    joined = "غير معروف"
+    # مثال النص: Joined May 2015
+    m_join = re.search(r"Joined\s+([^<\n]+)", html_page)
+    if m_join:
+        joined = m_join.group(1).strip()
 
     profile = {
-        "name": user.get("displayname") or username,
-        "username": user.get("username") or username,
+        "name": name,
+        "username": username,
         "bio": bio,
         "loc": loc,
         "joined": joined,
-        "followers": user.get("followersCount", 0),
-        "friends": user.get("friendsCount", 0),
     }
 
-    # نجمع مجموعة تغريدات من نفس الخرج
+    # 2) RSS للتغريدات
+    rss_text, _ = fetch_from_nitter(f"/{username}/rss")
     tweets = []
-    for ln in lines[:120]:  # 120 تغريدة تكفي للتحليل
-        try:
-            t = json.loads(ln)
-            content = t.get("content") or t.get("renderedContent") or ""
-            content = content.strip()
-            if not content:
-                continue
-            date_str = t.get("date") or t.get("created")
-            tweets.append(
-                {
-                    "text": content,
-                    "date": date_str,
-                    "raw": t,
-                }
-            )
-        except Exception:
-            continue
+    sources_counter = Counter()
 
-    return profile, tweets
+    if rss_text:
+        items = re.findall(r"<item>(.*?)</item>", rss_text, re.S)
+        for it in items[:120]:  # ناخذ 120 تغريدة تكفي
+            # العنوان = نص التغريدة
+            m_title = re.search(r"<title>(.*?)</title>", it, re.S)
+            if not m_title:
+                continue
+            t_html = m_title.group(1)
+            t_txt = strip_tags(html.unescape(t_html)).strip()
+            if not t_txt:
+                continue
+
+            # التاريخ
+            m_date = re.search(r"<pubDate>(.*?)</pubDate>", it, re.S)
+            date_str = m_date.group(1).strip() if m_date else None
+            # نحاول نحول التاريخ لصيغة معروفة
+            norm_date = None
+            if date_str:
+                try:
+                    dt = datetime.strptime(
+                        date_str, "%a, %d %b %Y %H:%M:%S %z"
+                    )
+                    norm_date = dt.isoformat()
+                except Exception:
+                    norm_date = date_str
+
+            # المصدر (Twitter for iPhone / Web .. الخ) من description
+            m_desc = re.search(
+                r"<description>(.*?)</description>", it, re.S
+            )
+            src_txt = ""
+            if m_desc:
+                desc_clean = html.unescape(
+                    strip_tags(m_desc.group(1))
+                )
+                # مثال: "RT @user: النص ... · Twitter for iPhone"
+                m_src = re.search(
+                    r"Twitter for ([A-Za-z0-9 ]+)", desc_clean
+                )
+                if m_src:
+                    src_txt = m_src.group(1).strip()
+                    sources_counter[src_txt] += 1
+
+            tweets.append({"text": t_txt, "date": norm_date})
+
+    return profile, tweets, sources_counter
 
 
 # =========================================
-# 🎂 استخراج يوم الميلاد من التغريدات
+# 📱 تحديد الجهاز من المصادر
+# =========================================
+def detect_device_from_sources(src_counter: Counter) -> str:
+    if not src_counter:
+        return "غير معروف"
+
+    top_src, _ = src_counter.most_common(1)[0]
+    if "iPhone" in top_src:
+        return "iPhone"
+    if "Android" in top_src:
+        return "Android"
+    if "Web" in top_src or "web" in top_src:
+        return "Web"
+    return top_src
+
+
+# =========================================
+# 🎂 يوم الميلاد من التغريدات
 # =========================================
 def detect_birthday_from_tweets(tweets):
     keywords = [
@@ -130,31 +218,30 @@ def detect_birthday_from_tweets(tweets):
 
     for tw in tweets:
         txt = tw["text"]
-        if any(kw.lower() in txt.lower() for kw in keywords):
-            date = tw["date"]
-            if date:
+        low = txt.lower()
+        if any(kw.lower() in low for kw in keywords):
+            d = tw["date"]
+            if d:
                 try:
-                    dt = datetime.fromisoformat(date.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(d)
                     d_str = dt.strftime("%Y-%m-%d")
                 except Exception:
-                    d_str = str(date)
+                    d_str = d
             else:
                 d_str = "غير معروف"
-
             snippet = txt[:80].replace("\n", " ")
             return (
-                f"🎂 <b>يوم ميلاده (بالدليل):</b>\n"
-                f"✅ لقيناه!\n"
+                "🎂 يوم ميلاده (بالدليل):\n"
+                "✅ لقيناه!\n"
                 f"التاريخ: {d_str}\n"
-                f'الدليل تغريدة يقول: "<i>{html.escape(snippet)}...</i>"'
+                f'الدليل تغريدة يقول: "{html.escape(snippet)}..."'
             )
 
-    # لو ما لقينا شي واضح
-    return "🎂 <b>يوم ميلاده (بالدليل):</b> للحين ما لقينا شي واضح من تغريداته."
+    return "🎂 يوم ميلاده (بالدليل):\nما لقيت شي واضح عن يوم ميلاده من تغريداته."
 
 
 # =========================================
-# 📍 تحديد الموقع من سوالفه
+# 📍 موقعه من سوالفه
 # =========================================
 def detect_location_from_tweets(tweets):
     cities = [
@@ -166,8 +253,6 @@ def detect_location_from_tweets(tweets):
         "مكه",
         "المدينة",
         "المدينه",
-        "الشرقية",
-        "الشرقيه",
         "القصيم",
         "أبها",
         "ابها",
@@ -177,122 +262,119 @@ def detect_location_from_tweets(tweets):
         "الخبر",
         "الكويت",
         "دبي",
+        "الشرقية",
+        "الشرقيه",
     ]
 
     for tw in tweets:
         txt = tw["text"]
         for city in cities:
             if city in txt:
-                date = tw["date"]
-                if date:
+                d = tw["date"]
+                if d:
                     try:
-                        dt = datetime.fromisoformat(date.replace("Z", "+00:00"))
+                        dt = datetime.fromisoformat(d)
                         d_str = dt.strftime("%Y-%m-%d")
                     except Exception:
-                        d_str = str(date)
+                        d_str = d
                 else:
                     d_str = "غير معروف"
                 snippet = txt[:100].replace("\n", " ")
                 return (
-                    "📍 <b>موقعه (من سوالفه):</b>\n"
-                    f'قفطناه يقول: "<i>{html.escape(snippet)}...</i>"\n'
+                    "📍 موقعه (من سوالفه):\n"
+                    f'قفطناه يقول: "{html.escape(snippet)}..."\n'
                     f"بتاريخ: {d_str}"
                 )
 
-    return "📍 <b>موقعه (من سوالفه):</b> ما وضح من سوالفه وين ساكن بالضبط."
+    return "📍 موقعه (من سوالفه):\nما وضح من سوالفه وين ساكن بالضبط."
 
 
 # =========================================
-# 👥 اخوياه (اكثر ناس يرد عليهم / يذكرهم)
+# 👥 اخوياه (من المنشن)
 # =========================================
 def detect_friends_from_tweets(tweets):
-    mentions_counter = Counter()
-
+    counter = Counter()
     for tw in tweets:
-        raw = tw["raw"]
-        mentioned = raw.get("mentionedUsers") or []
-        for m in mentioned:
-            uname = m.get("username")
-            if uname:
-                mentions_counter[uname.lower()] += 1
-
-        # احتياط بالـ regex
         for m in re.findall(r"@([A-Za-z0-9_]+)", tw["text"]):
-            mentions_counter[m.lower()] += 1
+            counter[m.lower()] += 1
 
-    # استبعاد بعض الاشياء لو حبيت
+    # كم استبعاد بسيط
     ignore = {"twitter", "support", "x", "elonmusk"}
     for ig in ignore:
-        if ig in mentions_counter:
-            mentions_counter.pop(ig, None)
+        counter.pop(ig, None)
 
-    top = mentions_counter.most_common(5)
-    return top
+    return counter.most_common(5)
 
 
 # =========================================
-# 🧠 تحليل الشخصية (Rule-Based)
+# 🧠 تحليل شخصية (Rules)
 # =========================================
 def analyze_personality_rule_based(tweets):
     if not tweets:
-        return "ما لقيت تغريدات كفاية اقدر احكم منها."
+        return "ما في تغريدات كفاية اقدر احكم منها."
 
     text = " ".join(t["text"] for t in tweets).lower()
 
     aggro = len(
         re.findall(
-            r"(غبي|تافه|مرض|صياح|بزر|كريه|ياخي|تخلف|قذر|يا حيوان|يا كلب|زق|تهديد|حرب)",
+            r"(غبي|تافه|مرض|صياح|بزر|كريه|ياخي|تخلف|قذر|حيوان|كلب|زق|تفجير|حرب|قتل)",
             text,
         )
     )
     emo = len(
         re.findall(
-            r"(احبكم|حب|قلب|قلبي|سعيد|مبسوط|شاكر|شكرا|جميل|جمال|روعة|حلوين|لطيف)",
+            r"(احبكم|احبك|حب|قلب|قلبي|سعيد|مبسوط|شاكر|شكرا|جميل|جمال|روعة|لطيف|ودود)",
             text,
         )
     )
     ego = len(
-        re.findall(r"\b(انا|أنا|عن نفسي|رأيي|شخصياً|تجربتي|me|my|i )\b", text)
+        re.findall(
+            r"\b(انا|أنا|عن نفسي|رايي|رأيي|شخصيا|تجربتي|me|my|i )\b",
+            text,
+        )
     )
     intellect = len(
-        re.findall(r"(تحليل|منطق|واقعي|السبب|مستقبل|مشروع|تطوير|تقنية|بحث)", text)
+        re.findall(
+            r"(تحليل|منطق|واقعي|السبب|مستقبل|مشروع|تطوير|تقنية|سياسة|اقتصاد|بحث)",
+            text,
+        )
     )
 
     traits = []
 
     if aggro > emo:
         traits.append(
-            "⚠️ <b>يميل للحدة شوي:</b> اسلوبه فيه نبرة هجوم او تنمر ببعض التغريدات."
+            "⚠️ يميل للحدة شوي، اسلوبه فيه نبرة هجوم او تنمر في بعض التغريدات."
         )
     elif emo > aggro:
         traits.append(
-            "💖 <b>راعي مشاعر:</b> يميل للكلام اللطيف والدعم اكثر من الصدام."
+            "💖 يميل للكلام اللطيف والدعم اكثر من الصدام، جوه هادي نوعا ما."
         )
 
     if ego > 4:
         traits.append(
-            "😎 <b>واثق من نفسه:</b> يتكلم عن نفسه وتجربته وآراءه بشكل واضح ومتكرر."
+            "😎 واثق من نفسه، يحب يذكر رايه وتجربته بشكل واضح ومتكرر."
         )
 
     if intellect > 3:
         traits.append(
-            "🧠 <b>مفكر:</b> ماياخذ الامور بسطحية، يحاول يحلل ويتفلسف على الواقع والاحداث."
+            "🧠 يحب يحلل ويتفلسف على الاحداث، مو بس يتابعها بشكل سطحي."
         )
 
     if not traits:
         traits.append(
-            "⚖️ <b>شخصية متزنة:</b> تغريداته عادية غالباً، لا هو راعي مشاكل ولا مبالغ بالعاطفة."
+            "⚖️ شخصيته متوازنة، تغريداته عادية غالبا، لا هو راعي دراما ولا راعي مديح زايد."
         )
 
     return "\n".join(traits)
 
 
 # =========================================
-# 🎭 تحليل الهوايات (Rule-Based)
+# 🎭 تحليل الهوايات (Rules)
 # =========================================
 def analyze_hobbies_rule_based(tweets):
     if not tweets:
-        return "🤷‍♂️ <b>هواياته مو واضحة:</b> ما في محتوى كافي عن جوه."
+        return "هواياته مو واضحة، ما في محتوى كفاية عن جوه."
 
     text = " ".join(t["text"] for t in tweets).lower()
     sections = []
@@ -316,14 +398,14 @@ def analyze_hobbies_rule_based(tweets):
         if "fortnite" in text or "فورتنايت" in text:
             games.append("Fortnite")
 
-        desc = "🎮 <b>جيمر (غالباً PC):</b>\nواضح يحب القيمز ومواتر البي سي والقطع."
+        desc = "🎮 جيمر غالبا، واضح انه راعي قيمز وقطع."
         if games:
-            desc += f"\nالألعاب اللي بينت من تغريداته: {', '.join(games)}."
+            desc += f"\nالالعاب اللي تبينت من تغريداته: {', '.join(games)}."
         sections.append(desc)
 
-    # كورة
+    # كوره
     if re.search(r"(هلال|نصر|اتحاد|اهلي|أهلي|دوري|مباراة|هدف|messi|ronaldo)", text):
-        club = "متابع كورة عام"
+        club = "متابع للدوري والكورة بشكل عام"
         if "هلال" in text:
             club = "الهلال 💙"
         elif "نصر" in text:
@@ -334,7 +416,7 @@ def analyze_hobbies_rule_based(tweets):
             club = "الاهلي 💚"
 
         sections.append(
-            f"⚽ <b>الكورة:</b>\nشكله يشجع ({club}) ويتابع المباريات ونتايج الدوريات."
+            f"⚽ الكورة:\nيظهر انه يشجع ({club}) ويتابع المباريات والاخبار الرياضية."
         )
 
     # تقنية / امن سيبراني
@@ -343,16 +425,16 @@ def analyze_hobbies_rule_based(tweets):
         text,
     ):
         sections.append(
-            "💻 <b>تقني / امن سيبراني:</b>\nواضح مهتم بالتقنية، لينكس، او امن المعلومات والبرمجة."
+            "💻 تقني او راعي امن سيبراني، واضح يحب انظمة لينكس او البرمجة او مجال السيكيورتي."
         )
 
-    # انمي / ترفيه
+    # ترفيه / انمي
     if re.search(
         r"(anime|انمي|one piece|ون بيس|naruto|ناروتو|attack on titan|aot|netflix|نتفلكس|فلم|فيلم|مسلسل)",
         text,
     ):
         sections.append(
-            "📺 <b>ترفيه:</b>\nيتابع انمي او مسلسلات وافلام، جوه سهر ونتفلكس غالباً."
+            "📺 جوه ترفيهي، يتابع انمي او مسلسلات وافلام، غالبا جوه سهر ونتفلكس."
         )
 
     # سيارات
@@ -361,26 +443,24 @@ def analyze_hobbies_rule_based(tweets):
         text,
     ):
         sections.append(
-            "🚗 <b>مواتر وسيارات:</b>\nعنده اهتمام بالسيارات، التزويد او التفحيط او السواقه عموماً."
+            "🚗 راعي مواتر او سيارات، مهتم بالتزويد او السواقه او محتوى السيارات بشكل عام."
         )
 
     if not sections:
-        return "🤷‍♂️ <b>هواياته مو واضحة:</b> محتواه ما يعطينا صورة واضحة عن جوه."
+        return "هواياته مو واضحه من تغريداته، يا انه ما يتكلم عنها او حسابه عام جدا."
 
     return "\n".join(sections)
 
 
 # =========================================
-# 🚨 الفحص الأمني (الفاظ / عدوانية)
+# 🚨 الفحص الامني (الفاظ)
 # =========================================
 def security_check(tweets):
     bad_words = [
         "لعن",
         "كسم",
-        "كس ",
         "قذر",
         "زبالة",
-        "زبااله",
         "منحط",
         "كلب",
         "حيوان",
@@ -394,35 +474,32 @@ def security_check(tweets):
     for tw in tweets:
         txt = tw["text"]
         if any(bw in txt for bw in bad_words):
-            date = tw["date"]
-            if date:
+            d = tw["date"]
+            year = "غير معروف"
+            if d:
                 try:
-                    dt = datetime.fromisoformat(date.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(d)
                     year = dt.year
                 except Exception:
-                    year = date
-            else:
-                year = "غير معروف"
+                    year = d
             snippet = txt[:100].replace("\n", " ")
             return (
-                "🚨 <b>الفحص الأمني (الولاء والماضي):</b>\n"
+                "🚨 الفحص الامني (الولاء والماضي):\n"
                 "⚠️ فيه تغريدات فيها الفاظ او نبرة عدوانية.\n"
-                f"<b>مثال (سنة {year}):</b>\n<i>\"{html.escape(snippet)}...\"</i>"
+                f"مثال (سنة {year}):\n\"{html.escape(snippet)}...\""
             )
 
-    return "✅ <b>الفحص الأمني (الولاء والماضي):</b>\nما ظهر عندي شي خطير من ناحية الفاظ او عدوانية واضحة."
+    return "🚨 الفحص الامني (الولاء والماضي):\n✅ ما شفت شي مقلق من ناحية الفاظ او عدوانية واضحة."
 
 
 # =========================================
 # 🤖 DeepSeek – ملخص AI
 # =========================================
 def deepseek_summary(profile, tweets, personality, hobbies, security_txt):
-    # ناخذ نص مختصر نرسله لـ AI
     joined_tweets = "\n".join(t["text"] for t in tweets[:40])
 
     prompt = f"""
-انت محلل اجتماعي ونفسي سعودي، ابيك تحلل صاحب هذا الحساب وتحط رايك بشكل مرتب وعامي، 
-بدون تنوين وبلهجة سعودية خفيفة بس تبقى محترم ومفهوم.
+انت محلل اجتماعي ونفسي سعودي، ابيك تحلل صاحب هذا الحساب وتحط رايك بشكل مرتب وبلهجة سعودية خفيفة بدون تنوين.
 
 معلومات الحساب:
 الاسم: {profile['name']}
@@ -430,16 +507,14 @@ def deepseek_summary(profile, tweets, personality, hobbies, security_txt):
 البايو: {profile['bio']}
 الموقع الرسمي: {profile['loc']}
 تاريخ انشاء الحساب: {profile['joined']}
-المتابعين: {profile['followers']}
-الي يتابعهم: {profile['friends']}
 
-تحليل الشخصية (من عندي كقواعد جاهزة):
+تحليل الشخصية (من نظام قواعد سابق):
 {personality}
 
-تحليل الهوايات (من عندي):
+تحليل الهوايات:
 {hobbies}
 
-الفحص الأمني:
+الفحص الامني:
 {security_txt}
 
 بعض من تغريداته:
@@ -447,14 +522,14 @@ def deepseek_summary(profile, tweets, personality, hobbies, security_txt):
 {joined_tweets}
 \"\"\"
 
-ابي منك ترد لي بنقاط مختصرة توضح:
-- نظرة عامة عن الشخص: رايق، متشنج، نرجسي، منطقي.. الخ
-- جوه العام: سوداوي، ايجابي، ساخر.. الخ
-- كيف ممكن يتعامل مع الناس (اونلاين): محترم، هجومي، يستفز.. الخ
-- اذا في شي ملفت او تحذير (بدون مبالغة او قذف)
 
-لا تعيد نفس الكلام اللي فوق، عطنا خلاصتك انت.
-استخدم عربي فقط.
+المطلوب منك:
+- تعطيني نظرة عامة عن هالشخصية (رايق، متوتر، هجومي، منطقي، نرجسي، حساس.. الخ).
+- جوه العام: ايجابي، سلبي، سوداوي، ساخر.. الخ.
+- طريقة تعامله مع الناس اونلاين: محترم، هجومي، دفاعي، يمزح بزيادة.. الخ.
+- اذا فيه نقاط ملفته او تحذير بسيط (بدون قذف او مبالغة).
+
+اكتب الاجابة بنقاط واضحة وبالعربي فقط، وباسلوب مفهوم.
 """
 
     try:
@@ -471,7 +546,7 @@ def deepseek_summary(profile, tweets, personality, hobbies, security_txt):
         data = r.json()
         return data["choices"][0]["message"]["content"]
     except Exception:
-        return "تعذر استخراج ملخص من الذكاء الاصطناعي، يمكن فيه مشكلة بالمفتاح او الاتصال."
+        return "ما قدرت اطلع ملخص من الذكاء الاصطناعي، غالبا فيه مشكلة في المفتاح او الاتصال."
 
 
 # =========================================
@@ -485,74 +560,66 @@ async def process_queue_worker(app: Application):
         try:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"ثواني بس @{username} ، قاعد انبش في تاريخه 👀",
+                text=f"ثواني بس @{username} قاعد انبش في تاريخه 👀",
                 parse_mode="HTML",
             )
 
-            profile, tweets = get_user_profile(username)
+            profile, tweets, src_counter = get_profile_and_tweets(username)
             if not profile:
                 await app.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ ما قدرت اجيب معلومات الحساب، يمكن اليوزر غلط او الحساب مخفي بقوة.",
+                    text="❌ ما قدرت اجيب معلومات الحساب، يمكن اليوزر غلط او الحساب محجوب بقوة.",
                 )
                 continue
 
-            # birthday
+            device = detect_device_from_sources(src_counter)
             birthday_block = detect_birthday_from_tweets(tweets)
-
-            # location from talk
             location_block = detect_location_from_tweets(tweets)
-
-            # friends
             friends = detect_friends_from_tweets(tweets)
-
-            # rule-based personality + hobbies + security
             personality = analyze_personality_rule_based(tweets)
             hobbies = analyze_hobbies_rule_based(tweets)
             security_txt = security_check(tweets)
-
-            # AI summary
             ai_summary = deepseek_summary(
                 profile, tweets, personality, hobbies, security_txt
             )
 
-            # بناء الاوتبوت النهائي
+            # بناء الاوت بوت النهائي بالشكل اللي تبيه
             msg = f"""الهدف: @{profile['username']}
 ──────────────
-📝 <b>البايو:</b>
+📝 البايو:
 {clean_text(profile['bio'])}
 
-📍 <b>الدولة (الرسمية):</b> {clean_text(profile['loc'])}
-📱 <b>يدخل من:</b> غير معروف
-📅 <b>موجود من:</b> {clean_text(profile['joined'])}
+📍 الدولة (الرسمية): {clean_text(profile['loc'])}
+📱 يدخل من: {clean_text(device)}
+📅 موجود من: {clean_text(profile['joined'])}
 ──────────────
 {birthday_block}
 ──────────────
 {location_block}
 ──────────────
-👥 <b>أخوياه (أكثر ناس يرد عليهم / يذكرهم):</b>
+👥 اخوياه (اكثر ناس يرد عليهم / يذكرهم):
 """
 
             if friends:
                 for i, (u, c) in enumerate(friends, 1):
-                    msg += f"{i}. <code>@{u}</code> (تكرر {c} مرة)\n"
+                    msg += f"{i}. @{u} (تكرر {c} مرة)\n"
             else:
                 msg += "ما فيه اسماء واضحة تتكرر كثير.\n"
 
             msg += f"""
 ──────────────
-🧠 <b>وش وضعه؟ (تحليل شخصيته – قواعد):</b>
+🧠 وش وضعه؟ (تحليل شخصيته):
 {personality}
 ──────────────
-🎭 <b>وش جوّه؟ (تحليل الهوايات – قواعد):</b>
+🎭 وش جوه؟ (تحليل الهوايات):
 {hobbies}
 ──────────────
 {security_txt}
 ──────────────
-🤖 <b>ملخص الذكاء الاصطناعي عنه:</b>
+🤖 ملخص الذكاء الاصطناعي:
 {ai_summary}
 
-👁‍🗨 <b>انتهى التقرير.</b>
+👁‍🗨 انتهى التقرير.
 """
 
             await app.bot.send_message(
@@ -579,7 +646,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = user.first_name or "حبيبي"
     await update.message.reply_text(
         f"👋 هلا والله {name}!\n\n"
-        "هات يوزر تويتر (بدون روابط) وانا اسرد لك تفاصيله بتقرير كامل 🔍",
+        "هات اليوزر و اسرد لك تفاصيله 🔍",
         parse_mode="HTML",
     )
 
@@ -587,7 +654,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_txt = (update.message.text or "").strip()
 
-    # تنظيف اليوزر من روابط الخ
+    # تنظيف اليوزر من روابط
     user_txt = user_txt.replace("https://", "").replace("http://", "")
     user_txt = user_txt.replace("www.", "")
     user_txt = user_txt.replace("x.com/", "").replace("twitter.com/", "")
@@ -606,13 +673,13 @@ async def handle_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q_size > 0:
         await update.message.reply_text(
             f"انتظر لين يجي دورك 🙏\n"
-            f"قدامك <b>{q_size}</b> في الطابور.\n"
+            f"قدامك {q_size} في الطابور.\n"
             "اقضي وقتك بالاستغفار ❤️",
             parse_mode="HTML",
         )
     else:
         await update.message.reply_text(
-            f"ثواني بس @{user_txt} ، قاعد انبش في تاريخه 👀",
+            f"ثواني بس @{user_txt} قاعد انبش في تاريخه 👀",
             parse_mode="HTML",
         )
 
@@ -627,8 +694,13 @@ async def post_init(application: Application):
 # 🚀 تشغيل البوت
 # =========================================
 if __name__ == "__main__":
-    print("🤖 Bot is running (Hybrid Twitter Analyzer)…")
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    print("🤖 Bot is running (Nitter Hybrid Analyzer)…")
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(
