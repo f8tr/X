@@ -1,0 +1,13 @@
+services:
+  - name: worker
+    type: worker
+    runtime: python
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    env:
+      PYTHON_VERSION: 3.11
